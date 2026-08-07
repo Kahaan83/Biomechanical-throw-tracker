@@ -2,7 +2,7 @@
 
 A wearable, dual-microcontroller glove that captures real-time kinematic and
 biomechanical data from an Ultimate Frisbee throw — and turns it into live
-sports-science metrics on a browser-based 3D dashboard.
+sports-science metrics on a browser-based 3D  dashboard.
 
 The system streams hand/forearm motion, muscle activation, and grip-release
 timing at up to ~100 Hz, then computes release speed, spin rate, snap force,
