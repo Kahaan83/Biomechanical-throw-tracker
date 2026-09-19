@@ -47,6 +47,16 @@
         .raw-label { color: #71717a; font-size: 0.8rem; text-transform: uppercase; font-weight: 600; letter-spacing: 1px;}
         .raw-value { font-family: monospace; font-size: 1.1rem; font-weight: 600; color: #e4e4e7; font-variant-numeric: tabular-nums; }
 
+        /* Demo Mode */
+        #demoBtn.demo-active { background: #7c3aed; color: #ffffff; border-color: #7c3aed; box-shadow: 0 0 20px rgba(124, 58, 237, 0.4); }
+        .demo-banner { background: linear-gradient(90deg, #1e1b4b, #2e1065); border: 1px solid #7c3aed; border-radius: 10px; padding: 10px 20px; margin-bottom: 18px; display: none; align-items: center; gap: 12px; }
+        .demo-banner.visible { display: flex; }
+        .demo-dot { width: 8px; height: 8px; border-radius: 50%; background: #a78bfa; animation: pulse 1.5s infinite; flex-shrink: 0; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        .demo-text { color: #c4b5fd; font-size: 0.85rem; font-weight: 600; letter-spacing: 0.5px; }
+        .demo-throw-btn { margin-left: auto; background: #7c3aed; color: #fff; border: none; padding: 6px 16px; border-radius: 6px; font-size: 0.8rem; font-weight: 700; letter-spacing: 1px; cursor: pointer; text-transform: uppercase; }
+        .demo-throw-btn:hover { background: #6d28d9; }
+
         /* Canvas & Charts */
         .chart-container { position: relative; height: 240px; width: 100%; margin-top: 15px; }
         #canvas3d { width: 100%; height: 280px; background: radial-gradient(circle at center, #18181b 0%, #000000 100%); border-radius: 12px; border: 1px solid #27272a; overflow: hidden; margin-top: 15px; }
@@ -59,10 +69,17 @@
         <h1>KINEMATIC ENGINE</h1>
         <div>
             <button id="calibrateBtn" style="margin-right: 12px;">Tare Geometry 🎯</button>
+            <button id="demoBtn" style="margin-right: 12px; border-color: #7c3aed; color: #c4b5fd;">Demo Mode ⚡</button>
             <button id="connectBtn">Initialize Serial Link</button>
         </div>
     </div>
     
+    <div class="demo-banner" id="demoBanner">
+        <div class="demo-dot"></div>
+        <span class="demo-text">DEMO MODE — Simulating live telemetry. No hardware required.</span>
+        <button class="demo-throw-btn" id="demoThrowBtn">Simulate Throw</button>
+    </div>
+
     <div class="dashboard-grid" id="dashboard">
         
         <div class="card physics-card" style="grid-column: span 2;">
@@ -244,6 +261,248 @@
     document.getElementById('calibrateBtn').addEventListener('click', () => {
         triggerCalibration = true;
     });
+
+    // =============================================
+    // DEMO MODE
+    // =============================================
+    let demoInterval = null;
+    let demoActive = false;
+    let demoThrowScheduled = false;
+
+    // Demo physics state (mirrors real state)
+    let demoIsGripped = false;
+    let demoVelX = 0, demoVelY = 0, demoVelZ = 0;
+    let demoPeakAccel = 0;
+    let demoPeakMuscle = 0;
+    let demoTimePeakMuscle = 0;
+    let demoSmoothedMuscle = 0;
+    let demoFrame = 0;
+    let demoThrowPhase = 0; // 0 = idle, 1 = grip, 2 = wind-up, 3 = snap, 4 = release
+    let demoPhaseTimer = 0;
+
+    // Smooth noise helper
+    function demoNoise(t, freq, amp) {
+        return amp * Math.sin(t * freq + 1.3) * Math.cos(t * freq * 0.7 + 0.5);
+    }
+
+    function runDemoTick() {
+        demoFrame++;
+        const t = demoFrame * 0.01;
+
+        // --- Generate simulated sensor data ---
+        let ax = demoNoise(t, 1.2, 0.3);
+        let ay = demoNoise(t, 0.9, 0.2) - 9.8; // gravity on Y at rest
+        let az = demoNoise(t, 1.5, 0.2);
+        let gx = demoNoise(t, 0.8, 0.05);
+        let gy = demoNoise(t, 1.1, 0.05);
+        let gz = demoNoise(t, 1.3, 0.05);
+        let fsrV = 0.05 + demoNoise(t, 2, 0.03);
+        let cardiacV = 1.5 + demoNoise(t, 8, 0.08);
+
+        // --- Throw sequence state machine ---
+        if (demoThrowScheduled && demoThrowPhase === 0) {
+            demoThrowPhase = 1;
+            demoPhaseTimer = 0;
+            demoThrowScheduled = false;
+        }
+
+        if (demoThrowPhase > 0) {
+            demoPhaseTimer++;
+
+            if (demoThrowPhase === 1) {
+                // GRIP — FSR rises quickly
+                const grip = Math.min(demoPhaseTimer / 20, 1.0);
+                fsrV = 0.5 + grip * 2.5 + demoNoise(t, 5, 0.05);
+                cardiacV = 1.5 + grip * 0.2;
+                if (demoPhaseTimer >= 25) { demoThrowPhase = 2; demoPhaseTimer = 0; }
+
+            } else if (demoThrowPhase === 2) {
+                // WIND-UP — moderate accel, strong grip maintained
+                const wu = demoPhaseTimer / 40;
+                fsrV = 2.8 + demoNoise(t, 4, 0.15);
+                ax = Math.sin(wu * Math.PI) * 12 + demoNoise(t, 6, 0.5);
+                ay = -9.8 + Math.cos(wu * Math.PI * 0.5) * 5;
+                az = demoNoise(t, 5, 1.5);
+                cardiacV = 1.5 + wu * 0.5 + demoNoise(t, 6, 0.06);
+                if (demoPhaseTimer >= 45) { demoThrowPhase = 3; demoPhaseTimer = 0; }
+
+            } else if (demoThrowPhase === 3) {
+                // SNAP — peak acceleration, wrist flick, gyro spike
+                const snap = demoPhaseTimer / 15;
+                const snapCurve = Math.sin(snap * Math.PI);
+                fsrV = 3.2 - snap * 0.5 + demoNoise(t, 8, 0.1);
+                ax = snapCurve * 35 + demoNoise(t, 10, 1);
+                ay = -9.8 + snapCurve * 10;
+                az = snapCurve * 20 + demoNoise(t, 12, 0.8);
+                gz = snapCurve * 28 + demoNoise(t, 8, 0.5); // wrist spin
+                gx = snapCurve * 8;
+                gy = snapCurve * 5;
+                cardiacV = 1.5 + snapCurve * 0.9 + demoNoise(t, 10, 0.05);
+                if (demoPhaseTimer >= 18) { demoThrowPhase = 4; demoPhaseTimer = 0; }
+
+            } else if (demoThrowPhase === 4) {
+                // RELEASE — FSR drops fast, disc gone
+                const rel = demoPhaseTimer / 20;
+                fsrV = Math.max(3.0 * (1 - rel * 2.5), 0.04) + demoNoise(t, 5, 0.02);
+                ax = (1 - rel) * 8 + demoNoise(t, 5, 0.3);
+                ay = -9.8 + demoNoise(t, 2, 0.2);
+                az = demoNoise(t, 3, 0.3);
+                gz = (1 - rel) * 15 + demoNoise(t, 4, 0.2);
+                cardiacV = 1.5 + (1 - rel) * 0.3;
+                if (demoPhaseTimer >= 22) { demoThrowPhase = 0; demoPhaseTimer = 0; }
+            }
+        }
+
+        // Animate 3D model with gentle idle rotation + throw motion
+        if (demoThrowPhase >= 2 && demoThrowPhase <= 4) {
+            const tp = demoPhaseTimer / 40;
+            const q = new THREE.Quaternion();
+            q.setFromEuler(new THREE.Euler(
+                tp * 0.4 - 0.2,
+                t * 0.3,
+                (demoThrowPhase === 3 ? tp * 0.8 : 0) + demoNoise(t, 1.5, 0.1)
+            ));
+            let q_combined = new THREE.Quaternion().copy(q_offset).multiply(q);
+            sensorBox.quaternion.slerp(q_combined, 0.15);
+        } else {
+            const idleQ = new THREE.Quaternion();
+            idleQ.setFromEuler(new THREE.Euler(
+                demoNoise(t, 0.3, 0.08),
+                t * 0.2 + demoNoise(t, 0.2, 0.05),
+                demoNoise(t, 0.4, 0.06)
+            ));
+            let q_combined = new THREE.Quaternion().copy(q_offset).multiply(idleQ);
+            sensorBox.quaternion.slerp(q_combined, 0.05);
+        }
+
+        // Build a fake quaternion for Euler extraction in physics
+        const eulerAngle = t * 0.2;
+        const q_calibrated = new THREE.Quaternion();
+        q_calibrated.setFromEuler(new THREE.Euler(
+            demoNoise(t, 0.3, 0.15),
+            eulerAngle,
+            demoNoise(t, 0.4, 0.1)
+        ));
+
+        // ---- Run through the same physics engine as real mode ----
+        document.getElementById('raw-cardiac').innerText = cardiacV.toFixed(3);
+        document.getElementById('raw-fsr').innerText = fsrV.toFixed(3);
+        document.getElementById('raw-gx').innerText = gz.toFixed(2);
+        document.getElementById('raw-qi').innerText = (Math.sin(t * 0.1) * 0.3).toFixed(3);
+        document.getElementById('raw-qj').innerText = (Math.cos(t * 0.13) * 0.2).toFixed(3);
+        document.getElementById('raw-qk').innerText = (Math.sin(t * 0.17) * 0.25).toFixed(3);
+        document.getElementById('raw-ax').innerText = ax.toFixed(2);
+        document.getElementById('raw-ay').innerText = ay.toFixed(2);
+        document.getElementById('raw-az').innerText = az.toFixed(2);
+
+        document.getElementById('val-fsr').innerText = fsrV.toFixed(3);
+        fsrChart.data.datasets[0].data.push(fsrV);
+        fsrChart.data.datasets[0].data.shift();
+        renderFrameCounter++;
+        if (renderFrameCounter % 3 === 0) fsrChart.update();
+
+        // EMG processing
+        let rectifiedMuscle = Math.abs(cardiacV - baselineCardiac);
+        demoSmoothedMuscle = (demoSmoothedMuscle * 0.90) + (rectifiedMuscle * 0.10) * 100;
+
+        const badge = document.getElementById('status-badge');
+
+        if (fsrV > 1.0 && !demoIsGripped) {
+            demoIsGripped = true;
+            demoVelX = 0; demoVelY = 0; demoVelZ = 0;
+            demoPeakMuscle = 0; demoPeakAccel = 0;
+            demoTimePeakMuscle = Date.now();
+            badge.innerText = "TRACKING MOTION...";
+            badge.style.background = "#eab308";
+            badge.style.color = "#09090b";
+            badge.style.borderColor = "#facc15";
+        }
+
+        if (demoIsGripped) {
+            demoVelX += ax * DT;
+            demoVelY += ay * DT;
+            demoVelZ += az * DT;
+            let accelMag = Math.sqrt(ax*ax + ay*ay + az*az);
+            if (accelMag > demoPeakAccel) demoPeakAccel = accelMag;
+            if (demoSmoothedMuscle > demoPeakMuscle) {
+                demoPeakMuscle = demoSmoothedMuscle;
+                demoTimePeakMuscle = Date.now();
+            }
+        }
+
+        if (fsrV < 0.5 && demoIsGripped) {
+            demoIsGripped = false;
+            badge.innerText = "RELEASE CAPTURED";
+            badge.style.background = "#059669";
+            badge.style.color = "#ffffff";
+            badge.style.borderColor = "#10b981";
+
+            const finalSpeed = Math.sqrt(demoVelX*demoVelX + demoVelY*demoVelY + demoVelZ*demoVelZ);
+            const spinMag = Math.sqrt(gx*gx + gy*gy + gz*gz);
+            const spinRPM = spinMag * 9.549;
+            const latency = Date.now() - demoTimePeakMuscle;
+            const force = DISC_MASS_KG * demoPeakAccel;
+
+            const pitch = Math.asin(2 * (q_calibrated.w * q_calibrated.y - q_calibrated.z * q_calibrated.x)) * (180 / Math.PI);
+            const roll = Math.atan2(2 * (q_calibrated.w * q_calibrated.x + q_calibrated.y * q_calibrated.z), 1 - 2 * (q_calibrated.x * q_calibrated.x + q_calibrated.y * q_calibrated.y)) * (180 / Math.PI);
+
+            document.getElementById('metric-speed').innerText = finalSpeed.toFixed(2);
+            document.getElementById('metric-accel').innerText = demoPeakAccel.toFixed(1);
+            document.getElementById('metric-spin').innerText = spinRPM.toFixed(0);
+            document.getElementById('metric-force').innerText = force.toFixed(1);
+            document.getElementById('metric-latency').innerText = latency;
+            document.getElementById('metric-pitch').innerText = pitch.toFixed(1);
+            document.getElementById('metric-roll').innerText = roll.toFixed(1);
+        }
+    }
+
+    document.getElementById('demoBtn').addEventListener('click', () => {
+        const demoBtn = document.getElementById('demoBtn');
+        if (!demoActive) {
+            // Start demo mode
+            demoActive = true;
+            demoBtn.innerText = "Stop Demo ✕";
+            demoBtn.classList.add('demo-active');
+            document.getElementById('demoBanner').classList.add('visible');
+            document.getElementById('dashboard').style.display = "grid";
+            window.dispatchEvent(new Event('resize'));
+
+            // Disable real connect while in demo
+            document.getElementById('connectBtn').disabled = true;
+            document.getElementById('connectBtn').style.opacity = '0.4';
+
+            demoInterval = setInterval(runDemoTick, 10); // 100Hz like real hardware
+
+            // Auto-trigger a first throw after 2s so visitors immediately see action
+            setTimeout(() => { demoThrowScheduled = true; }, 2000);
+        } else {
+            // Stop demo mode
+            demoActive = false;
+            clearInterval(demoInterval);
+            demoInterval = null;
+            demoThrowPhase = 0;
+            demoBtn.innerText = "Demo Mode ⚡";
+            demoBtn.classList.remove('demo-active');
+            document.getElementById('demoBanner').classList.remove('visible');
+            document.getElementById('dashboard').style.display = "none";
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('connectBtn').style.opacity = '1';
+            document.getElementById('status-badge').innerText = "AWAITING GRIP";
+            document.getElementById('status-badge').style.background = "";
+            document.getElementById('status-badge').style.color = "";
+            document.getElementById('status-badge').style.borderColor = "";
+        }
+    });
+
+    document.getElementById('demoThrowBtn').addEventListener('click', () => {
+        if (demoActive && demoThrowPhase === 0) {
+            demoThrowScheduled = true;
+        }
+    });
+
+    // =============================================
+    // END DEMO MODE
+    // =============================================
 
     document.getElementById('connectBtn').addEventListener('click', async () => {
         try {
